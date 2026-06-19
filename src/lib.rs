@@ -3,3 +3,4 @@
 //! has no rwx on the socket and cannot read the cred files (0600 broker-uid).
 
 pub mod creds;
+pub mod git_ops;
