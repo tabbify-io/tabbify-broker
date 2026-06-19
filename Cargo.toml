@@ -1,0 +1,32 @@
+[package]
+name = "tabbify-broker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Privileged in-FC credential broker: listens ONLY on /run/tabbify/broker.sock (0600), mediates git push/pull + Forgejo forge ops, returns results NEVER raw secrets."
+publish = false
+
+[[bin]]
+name = "tabbify-broker"
+path = "src/main.rs"
+
+[lib]
+name = "tabbify_broker"
+path = "src/lib.rs"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+tabbify-workspace-contract = { path = "../tabbify-workspace-contract" }
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
