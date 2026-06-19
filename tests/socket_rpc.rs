@@ -63,10 +63,12 @@ async fn list_caps_round_trip_and_socket_is_0600() {
 }
 
 #[tokio::test]
-async fn forge_list_arm_is_honest_not_implemented() {
-    // T5 owns the forge_list/open_pr/file_url handler arms. Until then they must
-    // return an HONEST error (internal, "not implemented") — never a fake
-    // success / empty list. This guards the §12 S2 split.
+async fn forge_list_arm_without_config_is_honest_needs_credential() {
+    // T5 landed the real forge_list arm. With NO forge configured (no
+    // TABBIFY_FORGE_URL/ORG and no owner creds), it must return an HONEST
+    // `needs_credential` — never a fake success / empty-list masquerading as
+    // data. This guards the §12 S2 split (the arm is real, but degrades honestly
+    // when the org was never provisioned).
     let td = tempfile::tempdir().unwrap();
     let sock = td.path().join("broker.sock");
     let caps = td.path().join("caps");
@@ -90,13 +92,9 @@ async fn forge_list_arm_is_honest_not_implemented() {
     let mut line = String::new();
     BufReader::new(r).read_line(&mut line).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(v["ok"], false, "forge_list is not implemented yet (T5)");
-    assert_eq!(v["error"]["code"], "internal");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not implemented"),
-        "must be an HONEST not-implemented, got: {line}"
+    assert_eq!(v["ok"], false, "forge_list must fail honestly when unconfigured");
+    assert_eq!(
+        v["error"]["code"], "needs_credential",
+        "unconfigured forge → needs_credential (not a fake empty list), got: {line}"
     );
 }

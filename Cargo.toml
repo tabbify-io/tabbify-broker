@@ -27,6 +27,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Forge push-cap key derivation (matches the supervisor's cap-key shape, §12 S3).
+blake3 = "1"
+hex = "0.4"
+uuid = { version = "1.23", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

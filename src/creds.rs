@@ -7,6 +7,22 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// The forge owner credentials the broker holds for THIS user's org (decrypted by
+/// auth, carried by node, written to the 0600 non-env file by the supervisor —
+/// §12 S1 / §4 / §11.0 D1). `admin_token` is the org-admin token (org-level
+/// reads); `owner_user`/`owner_password` let the broker BasicAuth-mint the
+/// per-org scoped push token (Forgejo restricts token minting to BasicAuth).
+///
+/// WIRE SHAPE PIN: the JSON keys MUST byte-match auth's `forge_admin::ForgeOwnerCreds`
+/// — the same JSON crosses auth→node→supervisor→broker. (Independent crates; only
+/// the JSON keys are the contract.)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ForgeOwnerCreds {
+    pub owner_user: String,
+    pub owner_password: String,
+    pub admin_token: String,
+}
+
 /// Held credentials. Cheap to clone (a handful of small strings); kept off the
 /// agent uid (the cap dir + this process are broker-uid only).
 #[derive(Clone, Default)]
@@ -14,7 +30,13 @@ pub struct Creds {
     /// `repo name` → cap-URL (`http://{host_ip}:8788/git/{cap}`). One per repo,
     /// written by the supervisor on workspace-create (§12 S1).
     git_caps: HashMap<String, String>,
+    /// Bare org-admin token only (legacy single-string `/run/tabbify/forge-admin`
+    /// file). Kept for `provision_repo`'s `forge_admin_token()` accessor.
     forge_admin_token: Option<String>,
+    /// Full owner creds, when the supervisor wrote the JSON blob (the channel that
+    /// enables `ensure_scoped_token`'s BasicAuth mint). `None` when only the bare
+    /// admin token (or nothing) is present.
+    forge_owner: Option<ForgeOwnerCreds>,
 }
 
 impl Creds {
@@ -37,13 +59,26 @@ impl Creds {
                 }
             }
         }
-        let forge_admin_token = forge_admin_path
+        // The supervisor writes EITHER a JSON `{owner_user, owner_password,
+        // admin_token}` blob (the full non-env channel, §12 S1 — enables the
+        // BasicAuth scoped-token mint) OR a legacy bare admin-token string. Parse
+        // the JSON first; fall back to treating the contents as a bare token.
+        let raw = forge_admin_path
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let (forge_admin_token, forge_owner) = match raw {
+            None => (None, None),
+            Some(s) => match serde_json::from_str::<ForgeOwnerCreds>(&s) {
+                Ok(creds) => (Some(creds.admin_token.clone()), Some(creds)),
+                // Not JSON → a legacy bare admin token; no owner creds (no mint).
+                Err(_) => (Some(s), None),
+            },
+        };
         Self {
             git_caps,
             forge_admin_token,
+            forge_owner,
         }
     }
 
@@ -56,6 +91,14 @@ impl Creds {
     /// to a caller — only used internally by `forge.rs`.
     pub fn forge_admin_token(&self) -> Option<&str> {
         self.forge_admin_token.as_deref()
+    }
+
+    /// The full forge owner creds (`{owner_user, owner_password, admin_token}`),
+    /// present only when the supervisor wrote the JSON blob. Needed by
+    /// `ensure_scoped_token` to BasicAuth-mint the scoped push token. Never
+    /// returned to a caller — only used internally by `forge.rs`.
+    pub fn forge_owner(&self) -> Option<&ForgeOwnerCreds> {
+        self.forge_owner.as_ref()
     }
 
     /// Capability NAMES only — for `list_caps`. Values are never exposed. Each
@@ -91,7 +134,21 @@ impl Creds {
                 }
             }
         }
+        if let Some(creds) = self.forge_owner.as_mut() {
+            for s in [
+                &mut creds.owner_user,
+                &mut creds.owner_password,
+                &mut creds.admin_token,
+            ] {
+                unsafe {
+                    for b in s.as_bytes_mut() {
+                        *b = 0;
+                    }
+                }
+            }
+        }
         self.git_caps.clear();
         self.forge_admin_token = None;
+        self.forge_owner = None;
     }
 }
