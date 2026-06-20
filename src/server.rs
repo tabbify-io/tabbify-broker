@@ -15,10 +15,26 @@ use crate::dispatch::dispatch;
 /// Serve broker RPC on `socket_path` until cancelled. Idempotent on a stale
 /// socket file (removes it first), then chmods to 0600. `creds` is held behind
 /// `Arc<Mutex<…>>` so the `pre_snapshot_scrub` op can drop the in-RAM secrets
-/// process-wide before a Full snapshot (spec §4).
+/// process-wide before a Full snapshot (spec §4) — and so the `:8732` HTTP
+/// control listener shares the SAME creds (a scrub drops the authkeys cap there
+/// too, after which add-key fails closed).
+///
+/// Convenience wrapper that owns the `Creds` (legacy / test callers); the binary
+/// uses [`serve_shared`] so it can hand the same `Arc<Mutex<Creds>>` to both the
+/// socket server and the HTTP control listener.
 pub async fn serve(
     socket_path: &Path,
     creds: Creds,
+    projects_root: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    serve_shared(socket_path, Arc::new(Mutex::new(creds)), projects_root).await
+}
+
+/// Serve broker RPC on `socket_path`, sharing `creds` with the caller (so the
+/// `:8732` HTTP control listener can scrub the same state). See [`serve`].
+pub async fn serve_shared(
+    socket_path: &Path,
+    creds: Arc<Mutex<Creds>>,
     projects_root: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(socket_path);
@@ -29,7 +45,6 @@ pub async fn serve(
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(socket = %socket_path.display(), "broker listening (0600)");
 
-    let creds = Arc::new(Mutex::new(creds));
     loop {
         let (stream, _) = listener.accept().await?;
         let creds = creds.clone();

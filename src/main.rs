@@ -7,11 +7,14 @@
 //! this so the live broker drops its in-RAM creds — a real socket round-trip,
 //! NOT the old `| /bin/true` no-op (spec §4 / review fix).
 use std::io::{BufRead, BufReader, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tabbify_broker::creds::Creds;
-use tabbify_broker::server::serve;
+use tabbify_broker::http_ctrl::{self, BROKER_CTRL_PORT};
+use tabbify_broker::server::serve_shared;
 use tabbify_workspace_contract::{BROKER_SOCKET, PROJECTS_DIR};
 
 #[tokio::main]
@@ -41,12 +44,28 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
-    serve(
-        &PathBuf::from(BROKER_SOCKET),
-        creds,
-        PathBuf::from(PROJECTS_DIR),
-    )
-    .await
+    // The token-gated :8732 add-key endpoint (§12 S6, T4 IDE-remote dynamic
+    // add-key). Binds the guest's IPv4 eth0 (0.0.0.0) — the runner's L4 forwarder
+    // dials guest_ip:8732 (IPv4) and bridges [app_ula]:8732 → here. It re-reads
+    // the authkeys cap FRESH from `caps_dir/authkeys.cap` per request (0600,
+    // broker-uid) — robust to init order + dropped by the pre-snapshot scrub. The
+    // AGENT can reach the port but holds no token (cannot read the cap-file).
+    let http_bind = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), BROKER_CTRL_PORT);
+    let http_caps_dir = caps_dir.clone();
+    let http = tokio::spawn(async move {
+        if let Err(e) = http_ctrl::serve(http_bind, http_caps_dir).await {
+            tracing::error!(error = %e, "broker :8732 control listener exited");
+        }
+    });
+
+    let socket_path = PathBuf::from(BROKER_SOCKET);
+    let socket = serve_shared(&socket_path, Arc::new(Mutex::new(creds)), PathBuf::from(PROJECTS_DIR));
+
+    // Run both concurrently; if the socket server returns (error/cancel), abort
+    // the HTTP task and propagate.
+    let result = socket.await;
+    http.abort();
+    result
 }
 
 /// One-shot client: tell the live broker to drop its in-RAM creds.

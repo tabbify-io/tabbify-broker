@@ -7,6 +7,7 @@ pub mod creds;
 pub mod dispatch;
 pub mod forge;
 pub mod git_ops;
+pub mod http_ctrl;
 pub mod request;
 pub mod server;
 

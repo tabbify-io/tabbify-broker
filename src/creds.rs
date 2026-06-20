@@ -42,8 +42,11 @@ pub struct Creds {
 
 impl Creds {
     /// Load from the §12-S1 cap directory + the optional forge-admin file. A
-    /// `<repo>.url` file maps repo `<repo>` → its cap-URL. Missing dir/files →
-    /// no caps (the matching op then returns `needs_credential`).
+    /// `<repo>.url` file maps repo `<repo>` → its cap-URL. Missing dir/files → no
+    /// caps (the matching op then returns `needs_credential`). The reserved
+    /// `authkeys.cap` file is NOT loaded here — the `:8732` HTTP endpoint
+    /// (`http_ctrl`) re-reads it FRESH per request so an init-order race / a
+    /// post-boot write is honored, and the scrub (file removal) fails it closed.
     pub fn load(caps_dir: &Path, forge_admin_path: Option<&Path>) -> Self {
         let mut git_caps = HashMap::new();
         if let Ok(rd) = std::fs::read_dir(caps_dir) {
@@ -152,4 +155,22 @@ impl Creds {
         self.forge_admin_token = None;
         self.forge_owner = None;
     }
+}
+
+/// Length-independent byte compare (no early exit on the first mismatch), so a
+/// timing observation cannot reveal how many leading bytes of the secret a guess
+/// matched. Unequal lengths still return `false` (the OR-folded `diff` is set by
+/// the length mismatch), so this is safe for variable-length tokens. Shared by
+/// the `:8732` HTTP authz path (`http_ctrl`) so both compares are constant-time.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        // Index past either end as 0 — keeps the loop count independent of where
+        // the first mismatch is, while still folding length into `diff` above.
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
