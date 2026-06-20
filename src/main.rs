@@ -26,9 +26,12 @@ async fn main() -> anyhow::Result<()> {
         return run_scrub();
     }
 
-    // §12 S1: the supervisor writes per-repo cap-URLs into this 0600 dir.
+    // §12 S1: the supervisor writes per-repo cap-URLs into this 0600 dir, and
+    // the forge-admin creds blob as the reserved `forge-admin.token` cap-file
+    // inside it (the caps scanner only consumes `*.url`, so this is ignored by
+    // the git-cap scan and read directly below).
     let caps_dir = PathBuf::from("/run/tabbify/caps");
-    let forge_admin = PathBuf::from("/run/tabbify/forge-admin");
+    let forge_admin = PathBuf::from("/run/tabbify/caps/forge-admin.token");
     let creds = Creds::load(
         &caps_dir,
         if forge_admin.exists() {

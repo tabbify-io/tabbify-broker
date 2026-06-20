@@ -1,6 +1,7 @@
 //! Credential custody. Loaded from the 0600 non-env files the SUPERVISOR writes
 //! into the FC (§12 S1): one PER-REPO cap-URL file `/run/tabbify/caps/<repo>.url`
-//! plus an optional `/run/tabbify/forge-admin`. The cap-URL NEVER arrives via
+//! plus the optional forge-admin creds at `/run/tabbify/caps/forge-admin.token`
+//! (the reserved cap-file name the supervisor writes). The cap-URL NEVER arrives via
 //! env or `/init` (spec §4 line 63). The raw values NEVER leave this module
 //! except as the remote on an outbound git/forge request the broker makes.
 
