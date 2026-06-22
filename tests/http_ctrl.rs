@@ -9,17 +9,25 @@
 //! caps-dir). This is the wire-level proof that the agent (which can reach :8732
 //! but holds no token, and cannot read the 0600 cap-file) cannot self-add a key.
 
+use std::sync::{Arc, Mutex};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use tabbify_broker::creds::Creds;
 use tabbify_broker::http_ctrl::{ParsedRequest, handle_add_key, parse_request};
 
-/// Drive one HTTP/1.1 request to `addr` and return `(status_code, body)`.
-async fn http_post(addr: std::net::SocketAddr, auth: Option<&str>, body: &str) -> (u16, String) {
+/// Drive one HTTP/1.1 request to `addr` (path included) and return `(status, body)`.
+async fn http_post_path(
+    addr: std::net::SocketAddr,
+    path: &str,
+    auth: Option<&str>,
+    body: &str,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let auth_line = auth.map(|a| format!("authorization: {a}\r\n")).unwrap_or_default();
     let req = format!(
-        "POST /v1/authorized-keys HTTP/1.1\r\nhost: x\r\n{auth_line}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "POST {path} HTTP/1.1\r\nhost: x\r\n{auth_line}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body,
     );
@@ -36,6 +44,11 @@ async fn http_post(addr: std::net::SocketAddr, auth: Option<&str>, body: &str) -
         .unwrap_or(0);
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned()).unwrap_or_default();
     (status, body)
+}
+
+/// Convenience: POST the add-key route.
+async fn http_post(addr: std::net::SocketAddr, auth: Option<&str>, body: &str) -> (u16, String) {
+    http_post_path(addr, "/v1/authorized-keys", auth, body).await
 }
 
 /// A caps dir with `authkeys.cap` = `token` (the temp dir keeps it alive).
@@ -55,8 +68,9 @@ async fn wire_authz_no_token_401_wrong_token_401_correct_token_passes() {
     let addr = listener.local_addr().unwrap();
     drop(listener); // free the port for the broker's own bind
     let serve_caps = caps_dir.clone();
+    let creds = Arc::new(Mutex::new(Creds::load(&caps_dir, None)));
     tokio::spawn(async move {
-        let _ = tabbify_broker::http_ctrl::serve(addr, serve_caps).await;
+        let _ = tabbify_broker::http_ctrl::serve(addr, serve_caps, creds).await;
     });
     // Wait for the listener to come up.
     for _ in 0..50 {
@@ -98,8 +112,9 @@ async fn wire_no_cap_file_fails_closed() {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let serve_caps = caps.clone();
+    let creds = Arc::new(Mutex::new(Creds::load(&caps, None)));
     tokio::spawn(async move {
-        let _ = tabbify_broker::http_ctrl::serve(addr, serve_caps).await;
+        let _ = tabbify_broker::http_ctrl::serve(addr, serve_caps, creds).await;
     });
     for _ in 0..50 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -111,6 +126,60 @@ async fn wire_no_cap_file_fails_closed() {
     // Even presenting a "Bearer something" → 401 (nothing to match against).
     let (s, _b) = http_post(addr, Some("Bearer guess"), key).await;
     assert_eq!(s, 401, "no cap file → fail closed");
+}
+
+/// GAP#4 wire proof: the runner POSTs `/v1/pre-snapshot-scrub` on `:8732` BEFORE
+/// the supervisor pauses the VM. After it: (1) the scrub returns 200; (2) the
+/// in-RAM creds are dropped (the shared cell is empty); (3) the authkeys cap-file
+/// is gone so a SUBSEQUENT add-key — even with the previously-valid token — fails
+/// closed (401). This is exactly the snapshot-safe post-condition GAP#4 requires:
+/// a Full snapshot taken now freezes no live cap-URL / token.
+#[tokio::test]
+async fn wire_pre_snapshot_scrub_drops_creds_and_makes_addkey_fail_closed() {
+    let (caps_dir, _td) = caps_dir_with_cap("THE-WIRE-CAP");
+    // Also drop a per-repo cap-URL so the in-RAM creds are non-empty pre-scrub.
+    std::fs::write(caps_dir.join("app.url"), "http://h:8788/git/CAP\n").unwrap();
+    let creds = Arc::new(Mutex::new(Creds::load(&caps_dir, None)));
+    assert!(
+        !creds.lock().unwrap().cap_names().is_empty(),
+        "pre-condition: broker holds the git cap"
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let serve_caps = caps_dir.clone();
+    let serve_creds = creds.clone();
+    tokio::spawn(async move {
+        let _ = tabbify_broker::http_ctrl::serve(addr, serve_caps, serve_creds).await;
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Sanity: BEFORE the scrub the valid token is accepted (not 401).
+    let key = r#"{"public_key":"ssh-ed25519 AAAA u@l"}"#;
+    let (s, _b) = http_post(addr, Some("Bearer THE-WIRE-CAP"), key).await;
+    assert_ne!(s, 401, "valid token must pass authz before scrub (got {s})");
+
+    // The scrub: drop-only, no auth → 200.
+    let (s, _b) = http_post_path(addr, "/v1/pre-snapshot-scrub", None, "").await;
+    assert_eq!(s, 200, "scrub must return 200");
+
+    // 1. In-RAM creds dropped process-wide (shared cell).
+    assert!(
+        creds.lock().unwrap().cap_names().is_empty(),
+        "scrub must drop the in-RAM creds"
+    );
+    // 2. Cred files removed.
+    assert!(!caps_dir.join("authkeys.cap").exists());
+    assert!(!caps_dir.join("app.url").exists());
+    // 3. A subsequent add-key with the previously-valid token now FAILS CLOSED.
+    let (s, _b) = http_post(addr, Some("Bearer THE-WIRE-CAP"), key).await;
+    assert_eq!(s, 401, "after scrub the cap-file is gone → add-key fails closed");
 }
 
 /// `parse_request` + `handle_add_key` round-trip stays consistent with the wire:

@@ -22,12 +22,13 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::authorized_keys::add_ssh_key;
-use crate::creds::constant_time_eq;
+use crate::creds::{Creds, constant_time_eq};
 
 /// The in-FC port the broker serves the token-gated add-key endpoint on. NOT a
 /// frozen-contract value — an admin/control seam (§12 S6); the runner forwards
@@ -36,8 +37,19 @@ use crate::creds::constant_time_eq;
 /// Flipping it here is the single point of change if it must move.
 pub const BROKER_CTRL_PORT: u16 = 8732;
 
-/// The one route this listener serves.
+/// The add-key route this listener serves.
 const AUTH_KEYS_PATH: &str = "/v1/authorized-keys";
+/// The pre-snapshot scrub route (GAP#4). The supervisor's runner POSTs this from
+/// the HOST (`guest_ip:8732`) IMMEDIATELY before pausing the VM for a Full
+/// snapshot, so no live cap-URL / token survives into the warm-restore snapshot.
+/// It is the HOST-reachable, broker-uid twin of the in-guest `tabbify-broker
+/// --scrub` (the broker socket is broker-uid-only and unreachable from the host).
+/// Unauthenticated by design: the op only DROPS the broker's own creds — an agent
+/// hitting it can at worst self-DoS (the next git op returns `needs_credential`;
+/// the supervisor re-writes fresh caps on warm restore), NEVER gain a capability.
+/// It must NOT be gated on the authkeys cap (the runner does not carry that cap
+/// host-side, and gating drop-only ops adds no security).
+const PRE_SNAPSHOT_SCRUB_PATH: &str = "/v1/pre-snapshot-scrub";
 /// The reserved cap-file name (under the caps dir) holding the authorized-keys
 /// cap (the `:8732` bearer token). Written 0600 broker-uid by the supervisor's
 /// runner; the agent uid cannot read it. Re-read fresh per request so an
@@ -170,6 +182,60 @@ where
     }
 }
 
+/// The reserved cred-file names removed by the pre-snapshot scrub (defence in
+/// depth on top of the in-RAM drop): the per-repo cap-URLs (`*.url`), the §12-S6
+/// authkeys cap (the `:8732` bearer token), and the forge-admin token. Mirrors
+/// `scripts/pre-snapshot-scrub.sh` so a broker RESTART after a warm restore
+/// re-reads nothing stale. The `*.url` files are enumerated (a glob); the named
+/// ones are removed explicitly.
+const SCRUBBED_CAP_FILES: &[&str] = &["authkeys.cap", "forge-admin.token"];
+
+/// Remove the on-disk cred files under `caps_dir` (the tmpfs cap area). Best
+/// effort: a missing file is fine (already absent / never written). Returns the
+/// count removed — used only for the log line, never leaks a value. Runs as the
+/// broker uid (the listener process), the only uid that can read/unlink the 0700
+/// cap dir's 0600 files.
+fn remove_cred_files(caps_dir: &Path) -> usize {
+    let mut removed = 0usize;
+    // Per-repo cap-URLs (`<repo>.url`).
+    if let Ok(rd) = std::fs::read_dir(caps_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".url")
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    for f in SCRUBBED_CAP_FILES {
+        if std::fs::remove_file(caps_dir.join(f)).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// THE pre-snapshot scrub core (GAP#4). Drops the broker's in-RAM creds
+/// ([`Creds::scrub`]) AND removes the tmpfs cred files ([`remove_cred_files`]),
+/// the SAME two halves `scripts/pre-snapshot-scrub.sh` performs. After this the
+/// broker holds NOTHING, the `:8732` add-key endpoint fails closed (the authkeys
+/// cap-file is gone → `None` per request), and a Full snapshot taken of the
+/// paused VM freezes no live cap-URL / token. Always `200 ok` (a drop-only op
+/// cannot meaningfully fail; a missing file is success).
+pub fn handle_scrub(creds: &Arc<Mutex<Creds>>, req: &ParsedRequest, caps_dir: &Path) -> HttpOutcome {
+    if req.path != PRE_SNAPSHOT_SCRUB_PATH {
+        return HttpOutcome::new(404, "not found");
+    }
+    if req.method != "POST" {
+        return HttpOutcome::new(405, "method not allowed");
+    }
+    creds.lock().unwrap().scrub();
+    let removed = remove_cred_files(caps_dir);
+    tracing::info!(removed, "pre-snapshot scrub: in-RAM creds dropped + cred files removed");
+    HttpOutcome::new(200, "ok")
+}
+
 /// Parse a buffered HTTP/1.1 request into the pieces [`handle_add_key`] needs.
 /// Minimal by design: request line + the `Authorization` header + the body after
 /// the blank line. Returns `None` on a malformed frame (no request line).
@@ -203,28 +269,41 @@ pub fn parse_request(raw: &str) -> Option<ParsedRequest> {
     })
 }
 
-/// Serve the token-gated `:8732` control endpoint until cancelled. Binds
-/// `0.0.0.0:BROKER_CTRL_PORT` (the runner forwards the app-ULA here). The
-/// authorized-keys cap is re-read FRESH from `caps_dir/authkeys.cap` (0600,
-/// broker-uid) per request — so a post-boot/init-race cap write is honored with
-/// no restart, and the pre-snapshot scrub (which deletes the file) makes the
-/// endpoint fail closed.
-pub async fn serve(bind: SocketAddr, caps_dir: PathBuf) -> anyhow::Result<()> {
+/// Serve the `:8732` control endpoint until cancelled. Binds
+/// `0.0.0.0:BROKER_CTRL_PORT` (the runner forwards the app-ULA here). Two routes:
+/// - `POST /v1/authorized-keys` — token-gated add-key. The authorized-keys cap is
+///   re-read FRESH from `caps_dir/authkeys.cap` (0600, broker-uid) per request —
+///   so a post-boot/init-race cap write is honored with no restart, and the
+///   pre-snapshot scrub (which deletes the file) makes the endpoint fail closed.
+/// - `POST /v1/pre-snapshot-scrub` — GAP#4 drop-only scrub. Shares the SAME
+///   `Arc<Mutex<Creds>>` the broker socket holds, so dropping in-RAM creds here is
+///   process-wide (the socket's next git op sees nothing).
+pub async fn serve(
+    bind: SocketAddr,
+    caps_dir: PathBuf,
+    creds: Arc<Mutex<Creds>>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
-    tracing::info!(%bind, caps_dir = %caps_dir.display(), "broker :8732 add-key control listener up (token-gated)");
+    tracing::info!(%bind, caps_dir = %caps_dir.display(), "broker :8732 control listener up (add-key token-gated + pre-snapshot-scrub)");
     loop {
         let (stream, _peer) = listener.accept().await?;
         let caps_dir = caps_dir.clone();
+        let creds = creds.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, &caps_dir).await {
+            if let Err(e) = handle_conn(stream, &caps_dir, &creds).await {
                 tracing::debug!(error = %e, "broker :8732 conn ended");
             }
         });
     }
 }
 
-/// Read one request off the connection, run the authz core, write the response.
-async fn handle_conn(mut stream: tokio::net::TcpStream, caps_dir: &Path) -> anyhow::Result<()> {
+/// Read one request off the connection, route it (add-key vs scrub), write the
+/// response.
+async fn handle_conn(
+    mut stream: tokio::net::TcpStream,
+    caps_dir: &Path,
+    creds: &Arc<Mutex<Creds>>,
+) -> anyhow::Result<()> {
     // Read until the header/body boundary, bounded by MAX_REQUEST_BYTES. The
     // request is tiny (one pubkey line); we read up to the cap then parse what we
     // have (no Content-Length streaming needed for this single small shape).
@@ -265,6 +344,10 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, caps_dir: &Path) -> anyh
 
     let raw = String::from_utf8_lossy(&buf);
     let outcome = match parse_request(&raw) {
+        Some(req) if req.path == PRE_SNAPSHOT_SCRUB_PATH => {
+            // GAP#4: drop-only scrub (no authz — see PRE_SNAPSHOT_SCRUB_PATH).
+            handle_scrub(creds, &req, caps_dir)
+        }
         Some(req) => {
             // Resolve the cap FRESH per request (0600 broker-uid file) — robust to
             // init order + dropped by the pre-snapshot scrub.
@@ -501,6 +584,71 @@ mod tests {
         assert_eq!(p.path, "/v1/authorized-keys");
         assert_eq!(p.authorization.as_deref(), Some("Bearer TOK"));
         assert!(p.body.contains("ssh-ed25519"));
+    }
+
+    /// GAP#4: the scrub core drops in-RAM creds AND removes the tmpfs cred files,
+    /// returning 200. After it, `cap_names` is empty and the cred files are gone
+    /// (so a broker restart re-reads nothing and the snapshot freezes no secret).
+    #[test]
+    fn scrub_drops_ram_creds_and_removes_cred_files_returns_200() {
+        let td = tempfile::tempdir().unwrap();
+        let caps = td.path().join("caps");
+        std::fs::create_dir_all(&caps).unwrap();
+        // A per-repo cap-URL, the authkeys cap, and the forge-admin token.
+        std::fs::write(caps.join("app.url"), "http://h:8788/git/CAP\n").unwrap();
+        std::fs::write(caps.join("authkeys.cap"), "THE-CAP\n").unwrap();
+        std::fs::write(caps.join("forge-admin.token"), "ghs_secret\n").unwrap();
+        let creds = Arc::new(Mutex::new(Creds::load(
+            &caps,
+            Some(caps.join("forge-admin.token").as_path()),
+        )));
+        // Pre: the broker holds the cap + forge.
+        assert!(!creds.lock().unwrap().cap_names().is_empty());
+
+        let out = handle_scrub(
+            &creds,
+            &req("POST", PRE_SNAPSHOT_SCRUB_PATH, None, ""),
+            &caps,
+        );
+        assert_eq!(out.status, 200, "scrub must succeed");
+        // In-RAM creds dropped.
+        assert!(
+            creds.lock().unwrap().cap_names().is_empty(),
+            "scrub must drop the in-RAM creds so the snapshot freezes nothing"
+        );
+        // Cred files removed (defence in depth — a restart re-reads nothing).
+        assert!(!caps.join("app.url").exists(), "*.url must be removed");
+        assert!(!caps.join("authkeys.cap").exists(), "authkeys.cap must be removed");
+        assert!(
+            !caps.join("forge-admin.token").exists(),
+            "forge-admin.token must be removed"
+        );
+    }
+
+    /// The scrub route rejects the wrong method/path (defensive — the runner only
+    /// ever POSTs the exact path).
+    #[test]
+    fn scrub_wrong_method_or_path_is_405_or_404() {
+        let td = tempfile::tempdir().unwrap();
+        let caps = td.path().join("caps");
+        std::fs::create_dir_all(&caps).unwrap();
+        let creds = Arc::new(Mutex::new(Creds::default()));
+        let g = handle_scrub(&creds, &req("GET", PRE_SNAPSHOT_SCRUB_PATH, None, ""), &caps);
+        assert_eq!(g.status, 405);
+        let p = handle_scrub(&creds, &req("POST", "/v1/other", None, ""), &caps);
+        assert_eq!(p.status, 404);
+    }
+
+    /// `remove_cred_files` is idempotent: removing from an empty/already-scrubbed
+    /// dir is success (no panic), and a missing dir is tolerated.
+    #[test]
+    fn remove_cred_files_is_idempotent_and_tolerates_absence() {
+        let td = tempfile::tempdir().unwrap();
+        let caps = td.path().join("caps");
+        std::fs::create_dir_all(&caps).unwrap();
+        assert_eq!(remove_cred_files(&caps), 0, "empty dir → nothing removed");
+        // A missing dir must not panic.
+        let _ = remove_cred_files(&td.path().join("nope"));
     }
 
     /// Helper: validate a key like `add_ssh_key` but without touching the real
