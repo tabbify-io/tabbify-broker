@@ -43,23 +43,28 @@ async fn main() -> anyhow::Result<()> {
             None
         },
     );
+    // ONE shared cred cell across BOTH listeners (the unix socket + the :8732 HTTP
+    // control endpoint), so the pre-snapshot scrub drops the in-RAM creds
+    // PROCESS-WIDE — the socket's next git op then sees nothing. (spec §4 / GAP#4).
+    let creds = Arc::new(Mutex::new(creds));
 
-    // The token-gated :8732 add-key endpoint (§12 S6, T4 IDE-remote dynamic
-    // add-key). Binds the guest's IPv4 eth0 (0.0.0.0) — the runner's L4 forwarder
-    // dials guest_ip:8732 (IPv4) and bridges [app_ula]:8732 → here. It re-reads
-    // the authkeys cap FRESH from `caps_dir/authkeys.cap` per request (0600,
-    // broker-uid) — robust to init order + dropped by the pre-snapshot scrub. The
-    // AGENT can reach the port but holds no token (cannot read the cap-file).
+    // The :8732 HTTP control endpoint (§12 S6 add-key + GAP#4 pre-snapshot-scrub).
+    // Binds the guest's IPv4 eth0 (0.0.0.0) — the runner's L4 forwarder dials
+    // guest_ip:8732 (IPv4) and bridges [app_ula]:8732 → here. add-key re-reads the
+    // authkeys cap FRESH per request (0600, broker-uid) — robust to init order +
+    // dropped by the scrub; the AGENT can reach the port but holds no token. The
+    // scrub route shares the cred cell below so it drops the broker's RAM creds.
     let http_bind = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), BROKER_CTRL_PORT);
     let http_caps_dir = caps_dir.clone();
+    let http_creds = creds.clone();
     let http = tokio::spawn(async move {
-        if let Err(e) = http_ctrl::serve(http_bind, http_caps_dir).await {
+        if let Err(e) = http_ctrl::serve(http_bind, http_caps_dir, http_creds).await {
             tracing::error!(error = %e, "broker :8732 control listener exited");
         }
     });
 
     let socket_path = PathBuf::from(BROKER_SOCKET);
-    let socket = serve_shared(&socket_path, Arc::new(Mutex::new(creds)), PathBuf::from(PROJECTS_DIR));
+    let socket = serve_shared(&socket_path, creds, PathBuf::from(PROJECTS_DIR));
 
     // Run both concurrently; if the socket server returns (error/cancel), abort
     // the HTTP task and propagate.
