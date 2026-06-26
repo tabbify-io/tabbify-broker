@@ -49,6 +49,12 @@ impl ForgejoRepo {
     }
 }
 
+/// Forgejo branch JSON (`GET /repos/{org}/{repo}/branches`).
+#[derive(serde::Deserialize)]
+struct ForgejoBranch {
+    name: String,
+}
+
 /// Forgejo's access-token JSON (`GET`/`POST /users/{u}/tokens`).
 #[derive(serde::Deserialize)]
 struct ForgejoToken {
@@ -212,6 +218,66 @@ impl ForgeClient {
         Ok(repo.default_branch)
     }
 
+    /// POST /repos/migrate — import (and optionally pull-mirror) an external
+    /// repo into `org`. `auth_token` авторизует приватный GitHub-источник.
+    pub async fn migrate_repo(
+        &self,
+        org: &str,
+        name: &str,
+        clone_addr: &str,
+        mirror: bool,
+        private: bool,
+        auth_token: Option<&str>,
+    ) -> anyhow::Result<ForgeRepoInfo> {
+        let mut body = serde_json::json!({
+            "repo_owner": org,
+            "repo_name": name,
+            "clone_addr": clone_addr,
+            "service": "git",
+            "mirror": mirror,
+            "private": private,
+        });
+        if let Some(t) = auth_token {
+            body["auth_token"] = serde_json::Value::String(t.to_owned());
+        }
+        let resp = self
+            .http
+            .post(self.api("/repos/migrate"))
+            .header("Authorization", format!("token {}", self.admin_token))
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(resp.status().is_success(), "forge migrate_repo: {}", resp.status());
+        let repo: ForgejoRepo = resp.json().await?;
+        Ok(repo.into_info())
+    }
+
+    /// GET /repos/{org}/{repo}/branches — all branch names.
+    pub async fn list_branches(&self, org: &str, repo: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(self.api(&format!("/repos/{org}/{repo}/branches")))
+            .header("Authorization", format!("token {}", self.admin_token))
+            .send()
+            .await?;
+        anyhow::ensure!(resp.status().is_success(), "forge list_branches: {}", resp.status());
+        let branches: Vec<ForgejoBranch> = resp.json().await?;
+        Ok(branches.into_iter().map(|b| b.name).collect())
+    }
+
+    /// POST /repos/{org}/{repo}/mirror-sync — trigger a pull-mirror sync now.
+    /// Пустое тело ответа — НЕ вызывать resp.json().
+    pub async fn mirror_sync(&self, org: &str, repo: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(self.api(&format!("/repos/{org}/{repo}/mirror-sync")))
+            .header("Authorization", format!("token {}", self.admin_token))
+            .send()
+            .await?;
+        anyhow::ensure!(resp.status().is_success(), "forge mirror_sync: {}", resp.status());
+        Ok(())
+    }
+
     /// Build a shareable web link to a file at a ref. Pure string build against
     /// `root_url` (no network) — Forgejo's web path is `/{org}/{repo}/src/{ref}/{path}`.
     #[must_use]
@@ -360,5 +426,40 @@ mod tests {
         let c = client("http://unused".into());
         let u = c.file_url("t_acme", "app", "main", "/src/lib.rs");
         assert_eq!(u.web_url, "http://forge.mesh/t_acme/app/src/main/src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn migrate_repo_posts_and_returns_info() {
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/repos/migrate"))
+            .and(wiremock::matchers::header("authorization", "token admintok"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(forgejo_repo_json("app", "t_acme")))
+            .mount(&srv).await;
+        let info = client(srv.uri()).migrate_repo("t_acme", "app",
+            "https://github.com/acme/app.git", true, true, Some("ghtok")).await.unwrap();
+        assert_eq!(info.full_name, "t_acme/app");
+    }
+
+    #[tokio::test]
+    async fn list_branches_returns_names() {
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/repos/t_acme/app/branches"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name":"main"},{"name":"dev"}
+            ])))
+            .mount(&srv).await;
+        assert_eq!(client(srv.uri()).list_branches("t_acme", "app").await.unwrap(), vec!["main","dev"]);
+    }
+
+    #[tokio::test]
+    async fn mirror_sync_posts_empty() {
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/repos/t_acme/app/mirror-sync"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&srv).await;
+        client(srv.uri()).mirror_sync("t_acme", "app").await.unwrap();
     }
 }
