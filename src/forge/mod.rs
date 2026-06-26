@@ -9,10 +9,12 @@
 //! `git_session` (the §12 S3 3-field shape).
 
 pub mod client;
+mod contents;
 pub mod git_session;
 pub mod handler;
 
 pub use client::ForgeClient;
+pub use contents::ForgeFile;
 pub use git_session::{FORGE_PUSH_CAP_TTL, GitSessionEntry, GitSessions};
 pub use handler::{
     ForgeContext, forge_file_url, forge_list_repos, forge_open_pr, register_forge_push_cap,
